@@ -12,7 +12,12 @@ use std::{
     os::raw::{c_char, c_void},
     path::Path,
 };
-use winit::{dpi::LogicalSize, Event, EventsLoop, Window, WindowBuilder, WindowEvent};
+use winit::{
+    dpi::PhysicalSize,
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::{Window, WindowBuilder},
+};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -20,13 +25,29 @@ const APP_NAME: &str = "Triangle";
 
 fn main() -> Result<(), Box<dyn Error>> {
     simple_logger::init()?;
-    Triangle::new()?.run()?;
-    Ok(())
+
+    let (window, event_loop) = create_window();
+    let mut app = Triangle::new(window)?;
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Poll;
+
+        match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => *control_flow = ControlFlow::Exit,
+            Event::LoopDestroyed => app
+                .wait_for_gpu()
+                .expect("Failed to wait for gpu to finish work"),
+            Event::MainEventsCleared => app.draw().expect("Failed to tick"),
+            _ => (),
+        }
+    });
 }
 
 struct Triangle {
     window: Window,
-    events_loop: EventsLoop,
     _entry: Entry,
     instance: Instance,
     debug_report: DebugReport,
@@ -54,10 +75,8 @@ struct Triangle {
 }
 
 impl Triangle {
-    fn new() -> Result<Self, Box<dyn Error>> {
+    fn new(window: Window) -> Result<Self, Box<dyn Error>> {
         log::info!("Create application");
-        // Setup window
-        let (window, events_loop) = create_window();
 
         // Vulkan instance
         let entry = Entry::new()?;
@@ -148,7 +167,6 @@ impl Triangle {
 
         Ok(Self {
             window,
-            events_loop,
             _entry: entry,
             instance,
             debug_report,
@@ -180,14 +198,13 @@ impl Triangle {
         log::debug!("Recreating the swapchain");
         // Wait for the window to be maximized before recreating the swapchain
         loop {
-            if let Some(LogicalSize { width, height }) = self.window.get_inner_size() {
-                if width > 0.0 && height > 0.0 {
-                    break;
-                }
+            let PhysicalSize { width, height } = self.window.inner_size();
+            if width > 0 && height > 0 {
+                break;
             }
         }
 
-        unsafe { self.device.device_wait_idle()? };
+        self.wait_for_gpu()?;
 
         unsafe { self.cleanup_swapchain() };
 
@@ -267,87 +284,70 @@ impl Triangle {
         self.swapchain.destroy_swapchain(self.swapchain_khr, None);
     }
 
-    fn run(&mut self) -> Result<(), Box<dyn Error>> {
-        log::info!("Starting application");
-        // Main loop
-        loop {
-            // Processing events
-            let mut should_stop = false;
-            self.events_loop.poll_events(|event| {
-                if let Event::WindowEvent {
-                    event: WindowEvent::CloseRequested,
-                    ..
-                } = event
-                {
-                    should_stop = true;
-                }
-            });
+    fn draw(&mut self) -> Result<(), Box<dyn Error>> {
+        // Waiting for gpu to finish. This is not good practice but we just want to keep things simple.
+        self.wait_for_gpu()?;
 
-            // Waiting for gpu to finish. This is not good practice but we just want to keep things simple.
-            unsafe { self.device.device_wait_idle()? };
-
-            if should_stop {
-                break;
+        // Drawing the frame
+        let next_image_result = unsafe {
+            self.swapchain.acquire_next_image(
+                self.swapchain_khr,
+                std::u64::MAX,
+                self.image_available_semaphore,
+                vk::Fence::null(),
+            )
+        };
+        let image_index = match next_image_result {
+            Ok((image_index, _)) => image_index,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.recreate_swapchain()?;
+                return Ok(());
             }
+            Err(error) => panic!("Error while acquiring next image. Cause: {}", error),
+        };
 
-            // Drawing the frame
-            let next_image_result = unsafe {
-                self.swapchain.acquire_next_image(
-                    self.swapchain_khr,
-                    std::u64::MAX,
-                    self.image_available_semaphore,
-                    vk::Fence::null(),
-                )
-            };
-            let image_index = match next_image_result {
-                Ok((image_index, _)) => image_index,
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.recreate_swapchain()?;
-                    continue;
-                }
-                Err(error) => panic!("Error while acquiring next image. Cause: {}", error),
-            };
+        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let wait_semaphores = [self.image_available_semaphore];
+        let signal_semaphores = [self.render_finished_semaphore];
 
-            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let wait_semaphores = [self.image_available_semaphore];
-            let signal_semaphores = [self.render_finished_semaphore];
+        let command_buffers = [self.command_buffers[image_index as usize]];
+        let submit_info = [vk::SubmitInfo::builder()
+            .wait_semaphores(&wait_semaphores)
+            .wait_dst_stage_mask(&wait_stages)
+            .command_buffers(&command_buffers)
+            .signal_semaphores(&signal_semaphores)
+            .build()];
+        unsafe {
+            self.device
+                .queue_submit(self.graphics_queue, &submit_info, vk::Fence::null())?
+        };
 
-            let command_buffers = [self.command_buffers[image_index as usize]];
-            let submit_info = [vk::SubmitInfo::builder()
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(&command_buffers)
-                .signal_semaphores(&signal_semaphores)
-                .build()];
-            unsafe {
-                self.device
-                    .queue_submit(self.graphics_queue, &submit_info, vk::Fence::null())?
-            };
+        let swapchains = [self.swapchain_khr];
+        let images_indices = [image_index];
+        let present_info = vk::PresentInfoKHR::builder()
+            .wait_semaphores(&signal_semaphores)
+            .swapchains(&swapchains)
+            .image_indices(&images_indices);
 
-            let swapchains = [self.swapchain_khr];
-            let images_indices = [image_index];
-            let present_info = vk::PresentInfoKHR::builder()
-                .wait_semaphores(&signal_semaphores)
-                .swapchains(&swapchains)
-                .image_indices(&images_indices);
-
-            let present_result = unsafe {
-                self.swapchain
-                    .queue_present(self.present_queue, &present_info)
-            };
-            match present_result {
-                Ok(is_suboptimal) if is_suboptimal => {
-                    self.recreate_swapchain()?;
-                }
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.recreate_swapchain()?;
-                }
-                Err(error) => panic!("Failed to present queue. Cause: {}", error),
-                _ => {}
+        let present_result = unsafe {
+            self.swapchain
+                .queue_present(self.present_queue, &present_info)
+        };
+        match present_result {
+            Ok(is_suboptimal) if is_suboptimal => {
+                self.recreate_swapchain()?;
             }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.recreate_swapchain()?;
+            }
+            Err(error) => panic!("Failed to present queue. Cause: {}", error),
+            _ => {}
         }
+        Ok(())
+    }
 
-        log::info!("Stopping application");
+    pub fn wait_for_gpu(&self) -> Result<(), Box<dyn Error>> {
+        unsafe { self.device.device_wait_idle()? };
         Ok(())
     }
 }
@@ -370,12 +370,12 @@ impl Drop for Triangle {
     }
 }
 
-fn create_window() -> (Window, EventsLoop) {
+fn create_window() -> (Window, EventLoop<()>) {
     log::debug!("Creating window and event loop");
-    let events_loop = EventsLoop::new();
+    let events_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title(APP_NAME)
-        .with_dimensions(LogicalSize::new(f64::from(WIDTH), f64::from(HEIGHT)))
+        .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT))
         .with_resizable(false)
         .build(&events_loop)
         .unwrap();
@@ -961,7 +961,6 @@ mod fs {
 
     #[cfg(target_os = "android")]
     pub fn load<P: AsRef<Path>>(path: P) -> Cursor<Vec<u8>> {
-
         let filename = path.as_ref().to_str().expect("Can`t convert Path to &str");
         match android_glue::load_asset(filename) {
             Ok(buf) => Cursor::new(buf),
@@ -977,7 +976,7 @@ mod surface {
     use ash::vk;
     use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
     use std::os::raw::c_char;
-    use winit::Window;
+    use winit::window::Window;
 
     #[derive(Copy, Clone, Debug)]
     pub enum SurfaceError {
@@ -1049,7 +1048,7 @@ mod surface {
                 let surface_loader = Win32Surface::new(entry, instance);
                 surface_loader
                     .create_win32_surface(&create_info, None)
-                    .map_err(|e| SurfaceError::SurfaceCreationError(e))
+                    .map_err(SurfaceError::SurfaceCreationError)
             }
             _ => Err(SurfaceError::WindowNotSupportedError),
         }
